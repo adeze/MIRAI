@@ -1,11 +1,13 @@
-import pandas as pd
 import os
 from tqdm import tqdm
 from collections import defaultdict
 import pyarrow.csv as pacsv
-import pyarrow.parquet as papq
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.dataset as ds
+import numpy as np
+import pandas as pd  # Import pandas
+import pyarrow.parquet as pq
 
 START_DATE = 202300 # dataset start date in format of yyyymm
 END_DATE = 202311 # dataset end date in format of yyyymm
@@ -25,30 +27,22 @@ COL_NAMES = [ # total 61 columns
 
 
 def merge_csv_files(csv_files):
-    # Create a PyArrow dataset from the partitioned CSV files
     try:
         dataset = ds.dataset(
             DATA_DIR,
             format="csv",
-            partitioning="hive",  # Assuming Hive-style partitioning
+            partitioning=None,
             parse_options=pacsv.ParseOptions(delimiter='\t', quote_char=False),
             read_options=pacsv.ReadOptions(column_names=COL_NAMES, autogenerate_column_names=False)
         )
-
-        # Convert the dataset to a PyArrow table
         table = dataset.to_table()
-
-        # Convert the PyArrow table to a Pandas DataFrame
-        df = table.to_pandas()
-
-        # Drop duplicates
-        df.drop_duplicates(subset='GlobalEventID', inplace=True)
-
-        return df
-
+        event_ids = table.column('GlobalEventID').to_numpy()
+        unique_event_ids, indices = np.unique(event_ids, return_index=True)
+        table_unique = table.take(indices)
+        return table_unique
     except Exception as e:
-        print(f"Error reading partitioned data: {e}")
-        return pd.DataFrame()  # Return an empty DataFrame in case of error
+        print(f"Error reading data: {e}")
+        return pa.table([])
 
 def load_txt_dict(lines):
     dict_a2b, dict_b2a = {}, {}
@@ -69,73 +63,118 @@ if __name__ == "__main__":
 
     # merge all 15min files to one file and save the raw data
     csv_files = os.listdir(DATA_DIR)
-    df = merge_csv_files(csv_files)
-    df.to_csv(os.path.join(output_directory, 'kg_raw.csv'), index=False, sep='\t')
-    print(f'kg_raw.csv saved, length: {len(df)}')
+    table = merge_csv_files(csv_files)
+    pq.write_table(table, os.path.join(output_directory, 'kg_samedate.parquet'))
+   #pacsv.write_csv(table, os.path.join(output_directory, 'kg_raw.csv'), delimiter='\t')
+    print(f'kg_raw.parquet saved, length: {table.num_rows}')
 
-    # check event date and the news date should be the same, and save the same date data
-    df['NewsDate'] = [x[:8] for x in df['DATEADDED']]
-    all_df = df.loc[df['Day'] == df['NewsDate']]
-    all_df.to_csv(os.path.join(output_directory, 'kg_samedate.csv'), index=False, sep='\t')
-    print(f'kg_samedate.csv saved, length: {len(all_df)}')
+    # check event date and the news date should be the same
+    news_dates = pc.utf8_slice(table['DATEADDED'], 0, 8)
+    table = table.append_column('NewsDate', news_dates)
+    mask = pc.equal(table['Day'], table['NewsDate'])
+    all_table = table.filter(mask)
+    pq.write_table(table, os.path.join(output_directory, 'kg_samedate.parquet'))
+    # pacsv.write_csv(all_table, os.path.join(output_directory, 'kg_samedate.csv'), delimiter='\t')
+    print(f'kg_samedate.csv saved, length: {all_table.num_rows}')
 
-    # start cleaning kg data
     # keep the earliest added date for each URL
+    urls = all_table['SOURCEURL'].to_numpy()
+    dates = all_table['NewsDate'].to_numpy()
     dict_url2date = defaultdict(set)
-    urls = all_df['SOURCEURL'].tolist()
-    dates = all_df['NewsDate'].tolist()
     for idx, url in tqdm(enumerate(urls), total=len(urls)):
         dict_url2date[url].add(dates[idx])
 
-    dict_url2date_unique = {}
-    for url, dates in dict_url2date.items():
-        dict_url2date_unique[url] = min(dates)
+    dict_url2date_unique = {url: min(dates) for url, dates in dict_url2date.items()}
+    url_days = pa.array([dict_url2date_unique[url.as_py()] for url in all_table['SOURCEURL']])
+    all_table = all_table.append_column('URLday', url_days)
 
-    all_df['URLday'] = [dict_url2date_unique[x] for x in all_df['SOURCEURL']]
-    all_df_url = all_df.query('NewsDate == URLday')
-    all_df_url.to_csv(os.path.join(output_directory, 'kg_urldate.csv'), index=False, sep='\t')
-    print(f'kg_urldate.csv saved, length: {len(all_df_url)}')
+    mask = pc.equal(all_table['NewsDate'], all_table['URLday'])
+    all_table_url = all_table.filter(mask)
+    pacsv.write_csv(all_table_url, os.path.join(output_directory, 'kg_urldate.csv'), delimiter='\t')
+    print(f'kg_urldate.csv saved, length: {all_table_url.num_rows}')
 
     # standardize actor name and event type
-    # filter out actors without country code
-    dict_iso2country, dict_country2iso =load_txt_dict(open('../data/info/ISO_country_GeoNames.txt', 'r').readlines())
-    all_df_info = all_df_url[all_df_url[['Actor1CountryCode', 'Actor2CountryCode']].notnull().all(1)]
-    all_df_info = all_df_info[all_df_info['Actor1CountryCode'].isin(dict_iso2country.keys())]
-    all_df_info = all_df_info[all_df_info['Actor2CountryCode'].isin(dict_iso2country.keys())]
-    # remove self-loops (s=o)
-    all_df_info = all_df_info[all_df_info['Actor1CountryCode'] != all_df_info['Actor2CountryCode']]
-    # map actor country code to actual country/region
-    all_df_info['Actor1CountryName'] = [dict_iso2country[x] for x in all_df_info['Actor1CountryCode']]
-    all_df_info['Actor2CountryName'] = [dict_iso2country[x] for x in all_df_info['Actor2CountryCode']]
+    dict_iso2country, dict_country2iso = load_txt_dict(open('../data/info/ISO_country_GeoNames.txt', 'r').readlines())
+    iso_keys = list(dict_iso2country.keys())
 
-    # filter out event type unavailable events
-    all_df_info = all_df_info[all_df_info['EventRootCode'] != '--']
-    # standardize the CAMEO code
+    # filter out actors without country code and not in iso dictionary
+    mask_notnull = pc.and_(
+        pc.is_valid(all_table_url['Actor1CountryCode']),
+        pc.is_valid(all_table_url['Actor2CountryCode'])
+    )
+    mask_in_iso = pc.and_(
+        pc.is_in(all_table_url['Actor1CountryCode'], value_set=iso_keys),
+        pc.is_in(all_table_url['Actor2CountryCode'], value_set=iso_keys)
+    )
+    mask_not_self = pc.not_equal(
+        all_table_url['Actor1CountryCode'],
+        all_table_url['Actor2CountryCode']
+    )
+
+    all_table_info = all_table_url.filter(pc.and_(mask_notnull, pc.and_(mask_in_iso, mask_not_self)))
+
+    # map country codes to names
+    actor1_names = pa.array([dict_iso2country[code.as_py()] for code in all_table_info['Actor1CountryCode']])
+    actor2_names = pa.array([dict_iso2country[code.as_py()] for code in all_table_info['Actor2CountryCode']])
+    all_table_info = all_table_info.append_column('Actor1CountryName', actor1_names)
+    all_table_info = all_table_info.append_column('Actor2CountryName', actor2_names)
+
+    # filter out invalid event types and standardize CAMEO codes
+    mask_valid_event = pc.not_equal(all_table_info['EventRootCode'], '--')
+    all_table_info = all_table_info.filter(mask_valid_event)
+
     dict_cameo2name, dict_name2cameo = load_txt_dict(open('../data/info/CAMEO_relation.txt', 'r').readlines())
-    all_df_info['RelName'] = [dict_cameo2name[x] for x in all_df_info['EventBaseCode']]
+    rel_names = pa.array([dict_cameo2name[code.as_py()] for code in all_table_info['EventBaseCode']])
+    all_table_info = all_table_info.append_column('RelName', rel_names)
 
-    # standardize the date format to 'YYYY-MM-DD'
-    dates = all_df_info['URLday'].tolist()
-    datestrs = [x[:4] + '-' + x[4:6] + '-' + x[6:] for x in dates]
-    all_df_info['DateStr'] = datestrs
+    # standardize date format
+    dates = all_table_info['URLday']
+    datestrs = pa.array([
+        f"{date.as_py()[:4]}-{date.as_py()[4:6]}-{date.as_py()[6:]}"
+        for date in dates
+    ])
+    all_table_info = all_table_info.append_column('DateStr', datestrs)
 
-    # generate event string
-    actor1_codes = all_df_info['Actor1CountryCode'].tolist()
-    actor2_codes = all_df_info['Actor2CountryCode'].tolist()
-    actor1_names = all_df_info['Actor1CountryName'].tolist()
-    actor2_names = all_df_info['Actor2CountryName'].tolist()
-    rel_codes = all_df_info['EventBaseCode'].tolist()
-    rel_names = all_df_info['RelName'].tolist()
+    # generate event strings
+    eventcodes = pa.array([
+        f"{date.as_py()}, {a1.as_py()}, {rel.as_py()}, {a2.as_py()}"
+        for date, a1, rel, a2 in zip(
+            datestrs,
+            all_table_info['Actor1CountryCode'],
+            all_table_info['EventBaseCode'],
+            all_table_info['Actor2CountryCode']
+        )
+    ])
 
-    eventcodes = [', '.join([datestrs[i], actor1_codes[i], rel_codes[i], actor2_codes[i]]) for i in range(len(datestrs))]
-    eventnames = [', '.join([datestrs[i], actor1_names[i], rel_names[i], actor2_names[i]]) for i in range(len(datestrs))]
-    eventfullstrs = [', '.join([datestrs[i], actor1_codes[i] + ' - ' + actor1_names[i], rel_codes[i] + '-' + rel_names[i], actor2_codes[i] + '-' + actor2_names[i]]) for i in range(len(datestrs))]
+    eventnames = pa.array([
+        f"{date.as_py()}, {a1.as_py()}, {rel.as_py()}, {a2.as_py()}"
+        for date, a1, rel, a2 in zip(
+            datestrs,
+            actor1_names,
+            rel_names,
+            actor2_names
+        )
+    ])
 
-    all_df_info['QuadEventCode'] = eventcodes
-    all_df_info['QuadEventName'] = eventnames
-    all_df_info['QuadEventFullStr'] = eventfullstrs
-    all_df_info.to_csv(os.path.join(output_directory, 'kg_info.csv'), index=False, sep='\t')
-    print(f'kg_info.csv saved, length: {len(all_df_info)}')
+    eventfullstrs = pa.array([
+        f"{date.as_py()}, {a1c.as_py()} - {a1n.as_py()}, {relc.as_py()}-{reln.as_py()}, {a2c.as_py()}-{a2n.as_py()}"
+        for date, a1c, a1n, relc, reln, a2c, a2n in zip(
+            datestrs,
+            all_table_info['Actor1CountryCode'],
+            actor1_names,
+            all_table_info['EventBaseCode'],
+            rel_names,
+            all_table_info['Actor2CountryCode'],
+            actor2_names
+        )
+    ])
+
+    all_table_info = all_table_info.append_column('QuadEventCode', eventcodes)
+    all_table_info = all_table_info.append_column('QuadEventName', eventnames)
+    all_table_info = all_table_info.append_column('QuadEventFullStr', eventfullstrs)
+
+    pacsv.write_csv(all_table_info, os.path.join(output_directory, 'kg_info.csv'), delimiter='\t')
+    print(f'kg_info.csv saved, length: {all_table_info.num_rows}')
 
 
 
