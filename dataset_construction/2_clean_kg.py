@@ -2,6 +2,9 @@ import pandas as pd
 import os
 from tqdm import tqdm
 from collections import defaultdict
+import pyarrow.csv as pacsv
+import pyarrow.parquet as papq
+import pyarrow as pa
 
 START_DATE = 202300 # dataset start date in format of yyyymm
 END_DATE = 202311 # dataset end date in format of yyyymm
@@ -24,8 +27,11 @@ def merge_csv_files(csv_files):
     dfs = []
     for idx, csv_file in tqdm(enumerate(csv_files), total=len(csv_files)):
         try:
-            df = pd.read_csv(os.path.join(DATA_DIR, csv_file), sep='\t', header=None, dtype=str)
-        except:
+            # Use pyarrow to read the CSV file
+            table = pacsv.read_csv(os.path.join(DATA_DIR, csv_file), parse_options=pacsv.ParseOptions(delimiter='\t', quote_char=False), read_options=pacsv.ReadOptions(column_names=COL_NAMES, autogenerate_column_names=False))
+            df = table.to_pandas() # Convert to pandas DataFrame for now (can optimize later)
+        except Exception as e:
+            print(f"Error reading {csv_file}: {e}")
             continue
         if len(df.columns) != 61:
             continue
