@@ -8,6 +8,8 @@ import pyarrow.dataset as ds
 import numpy as np
 import pandas as pd  # Import pandas
 import pyarrow.parquet as pq
+import pyarrow.feather as feather
+
 
 START_DATE = 202300 # dataset start date in format of yyyymm
 END_DATE = 202311 # dataset end date in format of yyyymm
@@ -25,24 +27,125 @@ COL_NAMES = [ # total 61 columns
     'DATEADDED', 'SOURCEURL' # 2 other event information
 ]
 
+my_schema = pa.schema([('GlobalEventID', pa.int64()),
+                       ('Day', pa.int64()),
+                       ('MonthYear', pa.int64()),
+                       ('Year', pa.int64()),
+                       ('FractionDate', pa.float64()),
+                       ('Actor1Code', pa.string()),
+                       ('Actor1Name', pa.string()),
+                       ('Actor1CountryCode', pa.string()),
+                       ('Actor1KnownGroupCode', pa.string()),
+                       ('Actor1EthnicCode', pa.string()),
+                       ('Actor1Religion1Code', pa.string()),
+                       ('Actor1Religion2Code', pa.string()),
+                       ('Actor1Type1Code', pa.string()),
+                       ('Actor1Type2Code', pa.string()),
+                       ('Actor1Type3Code', pa.string()),
+                       ('Actor2Code', pa.string()),
+                       ('Actor2Name', pa.string()),
+                       ('Actor2CountryCode', pa.string()),
+                       ('Actor2KnownGroupCode', pa.string()),
+                       ('Actor2EthnicCode', pa.string()),   
+                       ('Actor2Religion1Code', pa.string()),
+                       ('Actor2Religion2Code', pa.string()),
+                       ('Actor2Type1Code', pa.string()),
+                       ('Actor2Type2Code', pa.string()),
+                       ('Actor2Type3Code', pa.string()),
+                       ('IsRootEvent', pa.int64()),
+                       ('EventCode', pa.string()),
+                       ('EventBaseCode', pa.string()),
+                       ('EventRootCode', pa.string()),
+                       ('QuadClass', pa.int64()),
+                       ('GoldsteinScale', pa.float64()),
+                       ('NumMentions', pa.int64()),
+                       ('NumSources', pa.int64()),
+                       ('NumArticles', pa.int64()),
+                       ('AvgTone', pa.float64()), 
+                       ('Actor1Geo_Type', pa.string()),
+                       ('Actor1Geo_FullName', pa.string()),
+                       ('Actor1Geo_CountryCode', pa.string()),
+                       ('Actor1Geo_ADM1Code', pa.string()),
+                       ('Actor1Geo_Lat', pa.float64()),
+                       ('Actor1Geo_Long', pa.float64()),
+                       ('Actor1Geo_FeatureID', pa.string()),
+                       ('Actor2Geo_Type', pa.string()),
+                       ('Actor2Geo_FullName', pa.string()),
+                       ('Actor2Geo_CountryCode', pa.string()),
+                       ('Actor2Geo_ADM1Code', pa.string()),
+                       ('Actor2Geo_Lat', pa.float64()), 
+                       ('Actor2Geo_Long', pa.float64()),
+                       ('Actor2Geo_FeatureID', pa.string()),
+                       ('ActionGeo_Type', pa.string()),
+                       ('ActionGeo_FullName', pa.string()),
+                       ('ActionGeo_CountryCode', pa.string()),
+                       ('ActionGeo_ADM1Code', pa.string()),
+                       ('ActionGeo_Lat', pa.float64()),
+                       ('ActionGeo_Long', pa.float64()),
+                       ('ActionGeo_FeatureID', pa.string()),
+                       ('DATEADDED', pa.string()),
+                       ('SOURCEURL', pa.string()),
+                       ('Actor1Geo_Type', pa.string())
+                       ])
+column_types = {"GlobalEventID": pa.int64(),
+                "DATEADDED": pa.int32(),
+               
+                }
+
+
+part = ds.partitioning(
+    pa.schema([("year", pa.int16()),
+               ("month", pa.int8()),
+               ("day", pa.int32()),
+               ("hour", pa.int32()),
+               ("minute", pa.int32()),
+               ("second", pa.int32()),
+           
+               ]),
+    flavor="filename"
+)
+
+def skip_row(row: pacsv.InvalidRow):
+        print(row.text)
+        return 'skip'
+   
 
 def merge_csv_files(csv_files):
+    
+    timestamp_parsers=["%Y%m%d","%YYYY%MM", "%YYYY", "%Y.%f","%Y%m%d%H%M%S"]
+    parse_options = pacsv.ParseOptions(delimiter='\t', quote_char=False, double_quote=False ,invalid_row_handler=skip_row)  # or ',' depending on your file format
+    read_options = pacsv.ReadOptions(column_names=COL_NAMES, autogenerate_column_names=False)
+    convert_options = pacsv.ConvertOptions(strings_can_be_null=True,include_columns= COL_NAMES,auto_dict_encode=True,include_missing_columns=True,timestamp_parsers=timestamp_parsers) #,column_types=column_types
+    
+    csv_options = ds.CsvFileFormat(parse_options=parse_options,read_options=read_options, convert_options=convert_options)
+    output_directory = '../data/kg_tmp'
     try:
+      
+
         dataset = ds.dataset(
             DATA_DIR,
-            format="csv",
-            partitioning=None,
-            parse_options=pacsv.ParseOptions(delimiter='\t', quote_char=False),
-            read_options=pacsv.ReadOptions(column_names=COL_NAMES, autogenerate_column_names=False)
+            format=csv_options,
+          
         )
-        table = dataset.to_table()
-        event_ids = table.column('GlobalEventID').to_numpy()
-        unique_event_ids, indices = np.unique(event_ids, return_index=True)
-        table_unique = table.take(indices)
-        return table_unique
+        
+        schema  = dataset.schema
+        # # Create scanner with parse options
+        scanner = dataset.scanner()
+        ds.write_dataset(scanner,os.path.join(output_directory, 'kg_raw.parquet'), format="parquet",schema=None)
+        #.sort_by([("GlobalEventID", "ascending")])
+        for record_batch in dataset.to_batches():
+          printf(record_batch.num_rows)
+         
+        #   ds.write_dataset(a_table, os.path.join(output_directory, 'kg_raw.feather') ,format="feather")
+        
+        # event_ids = table.column('GlobalEventID').to_numpy()
+        # unique_event_ids, indices = np.unique(event_ids, return_index=True)
+        # table_unique = table.take(indices)
+       # return table_unique
+       
     except Exception as e:
         print(f"Error reading data: {e}")
-        return pa.table([])
+     #   return dataset.to_table()
 
 def load_txt_dict(lines):
     dict_a2b, dict_b2a = {}, {}
@@ -55,7 +158,7 @@ def load_txt_dict(lines):
 
 
 
-if __name__ == "__main__":
+if __name__ == "__main__": 
 
     output_directory = '../data/kg_tmp'
     if not os.path.exists(output_directory):
@@ -63,19 +166,23 @@ if __name__ == "__main__":
 
     # merge all 15min files to one file and save the raw data
     csv_files = os.listdir(DATA_DIR)
-    table = merge_csv_files(csv_files)
-    pq.write_table(table, os.path.join(output_directory, 'kg_samedate.parquet'))
-   #pacsv.write_csv(table, os.path.join(output_directory, 'kg_raw.csv'), delimiter='\t')
-    print(f'kg_raw.parquet saved, length: {table.num_rows}')
+    merge_csv_files(csv_files)
+    #feather.write_feather(table, os.path.join(output_directory, 'kg_raw.feather'))
+  #  print(f'kg_raw.feather saved, length: {table.num_rows}')
 
     # check event date and the news date should be the same
-    news_dates = pc.utf8_slice(table['DATEADDED'], 0, 8)
-    table = table.append_column('NewsDate', news_dates)
-    mask = pc.equal(table['Day'], table['NewsDate'])
-    all_table = table.filter(mask)
-    pq.write_table(table, os.path.join(output_directory, 'kg_samedate.parquet'))
-    # pacsv.write_csv(all_table, os.path.join(output_directory, 'kg_samedate.csv'), delimiter='\t')
-    print(f'kg_samedate.csv saved, length: {all_table.num_rows}')
+    date_added = table['DATEADDED'].to_numpy()
+    news_dates = np.array([str(d)[:8] for d in date_added])
+    table = table.append_column('NewsDate', pa.array(news_dates))
+    
+    # Compare Day and NewsDate
+    days = table['Day'].to_numpy()
+    news_dates = table['NewsDate'].to_numpy()
+    mask = days == news_dates
+    all_table = table.take(pa.array(np.where(mask)[0]))
+    
+    pq.write_table(all_table, os.path.join(output_directory, 'kg_samedate.parquet'))
+    print(f'kg_samedate.parquet saved, length: {all_table.num_rows}')
 
     # keep the earliest added date for each URL
     urls = all_table['SOURCEURL'].to_numpy()
@@ -85,13 +192,17 @@ if __name__ == "__main__":
         dict_url2date[url].add(dates[idx])
 
     dict_url2date_unique = {url: min(dates) for url, dates in dict_url2date.items()}
-    url_days = pa.array([dict_url2date_unique[url.as_py()] for url in all_table['SOURCEURL']])
+    url_days = pa.array([dict_url2date_unique[url] for url in urls])
     all_table = all_table.append_column('URLday', url_days)
 
-    mask = pc.equal(all_table['NewsDate'], all_table['URLday'])
-    all_table_url = all_table.filter(mask)
-    pacsv.write_csv(all_table_url, os.path.join(output_directory, 'kg_urldate.csv'), delimiter='\t')
-    print(f'kg_urldate.csv saved, length: {all_table_url.num_rows}')
+    # Filter where NewsDate equals URLday
+    news_dates = all_table['NewsDate'].to_numpy()
+    url_days = all_table['URLday'].to_numpy()
+    mask = news_dates == url_days
+    all_table_url = all_table.take(pa.array(np.where(mask)[0]))
+    
+    pq.write_table(all_table_url, os.path.join(output_directory, 'kg_urldate.parquet'))
+    print(f'kg_urldate.parquet saved, length: {all_table_url.num_rows}')
 
     # standardize actor name and event type
     dict_iso2country, dict_country2iso = load_txt_dict(open('../data/info/ISO_country_GeoNames.txt', 'r').readlines())
